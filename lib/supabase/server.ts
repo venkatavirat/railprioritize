@@ -52,6 +52,25 @@ export async function createSupabaseServerClient() {
  * Prefers the service-role key when present so optimizer writes are not
  * blocked by RLS; falls back to the anon key for local development.
  */
+export function hasServiceRoleKey(): boolean {
+  return Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY)
+}
+
+/**
+ * The right client for writing tenant-owned rows.
+ *
+ * With owner-scoped RLS live, a bare anon client has no session, so
+ * `auth.uid()` is NULL and every insert is rejected. Prefer the service-role
+ * key (which bypasses RLS -- isolation is then enforced by the explicit
+ * uploaded_by filters in lib/data-sources.ts); otherwise fall back to the
+ * request's cookie-aware client so `auth.uid()` matches the signed-in user
+ * and the policy is satisfied honestly.
+ */
+export async function createSupabaseWriteClient() {
+  if (hasServiceRoleKey()) return createSupabaseServiceClient()
+  return createSupabaseServerClient()
+}
+
 export function createSupabaseServiceClient() {
   const key =
     process.env.SUPABASE_SERVICE_ROLE_KEY ||

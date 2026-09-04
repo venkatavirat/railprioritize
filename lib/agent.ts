@@ -16,7 +16,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import { z } from 'zod'
 
 import { loadUnifiedDataset } from '@/lib/data-sources'
-import { createSupabaseServiceClient } from '@/lib/supabase/server'
+import { createSupabaseWriteClient } from '@/lib/supabase/server'
 import { computeDowntimeMetrics, minimumFeasibleHours } from '@/lib/downtime-metrics'
 import {
   analyseSpatialSafety,
@@ -389,7 +389,7 @@ async function persistProposals(
   })
 
   try {
-    const supabase = createSupabaseServiceClient()
+    const supabase = await createSupabaseWriteClient()
     const { error } = await supabase.from('block_schedules').insert(rows)
     if (error) return { saved: 0, error: error.message }
     return { saved: rows.length, error: null }

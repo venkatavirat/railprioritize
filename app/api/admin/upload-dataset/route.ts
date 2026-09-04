@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
   createSupabaseServerClient,
-  createSupabaseServiceClient,
+  createSupabaseWriteClient,
 } from '@/lib/supabase/server'
 import { isDevAuthBypassEnabled } from '@/lib/auth-flags'
 import {
@@ -202,7 +202,7 @@ export async function POST(request: NextRequest) {
   const droppedColumns: string[] = []
 
   try {
-    const supabase = createSupabaseServiceClient()
+    const supabase = await createSupabaseWriteClient()
 
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
       let batch = rows.slice(i, i + BATCH_SIZE).map((row) => {

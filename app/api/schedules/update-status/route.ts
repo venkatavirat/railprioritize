@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
   createSupabaseServerClient,
-  createSupabaseServiceClient,
+  createSupabaseWriteClient,
 } from '@/lib/supabase/server'
 import { isDevAuthBypassEnabled } from '@/lib/auth-flags'
 import { isBlockStatus, type BlockStatus } from '@/lib/types'
@@ -85,7 +85,7 @@ export async function POST(request: NextRequest) {
     )
   }
 
-  const supabase = createSupabaseServiceClient()
+  const supabase = await createSupabaseWriteClient()
 
   // ----- Read current state ----------------------------------------------
   const { data: existing, error: readError } = await supabase

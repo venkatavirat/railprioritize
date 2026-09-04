@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import {
   createSupabaseServerClient,
   createSupabaseServiceClient,
+  createSupabaseWriteClient,
 } from '@/lib/supabase/server'
 import { isDevAuthBypassEnabled } from '@/lib/auth-flags'
 import { loadUnifiedDataset, type SourceReport } from '@/lib/data-sources'
@@ -461,7 +462,7 @@ async function persistBlocks(
   if (rows.length === 0) return { saved: 0, error: null }
 
   try {
-    const supabase = createSupabaseServiceClient()
+    const supabase = await createSupabaseWriteClient()
     const { error } = await supabase.from('block_schedules').insert(rows)
     if (error) return { saved: 0, error: error.message }
     return { saved: rows.length, error: null }
