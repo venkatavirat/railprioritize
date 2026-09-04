@@ -1,19 +1,14 @@
 import { Analytics } from '@vercel/analytics/next'
 import type { Metadata, Viewport } from 'next'
-import { Plus_Jakarta_Sans, JetBrains_Mono } from 'next/font/google'
 import './globals.css'
 
-const plusJakartaSans = Plus_Jakarta_Sans({
-  subsets: ['latin'],
-  variable: '--font-plus-jakarta-sans',
-  display: 'swap',
-})
-
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ['latin'],
-  variable: '--font-jetbrains-mono',
-  display: 'swap',
-})
+// Fonts are deliberately NOT loaded through next/font/google.
+//
+// That loader fetches the font files at compile time, and when the fetch
+// fails Turbopack cannot resolve the generated module -- which takes down
+// app/layout.tsx and therefore every route in the app with a 500, including
+// the login page. Trading exact typography for a site that always boots is
+// the right way round; the stacks in globals.css cover both variables.
 
 export const metadata: Metadata = {
   title: 'RailPrioritize | Indian Railways Operations',
@@ -52,8 +47,8 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en" className={`${plusJakartaSans.variable} ${jetbrainsMono.variable}`}>
-      <body className="font-plus-jakarta-sans antialiased">
+    <html lang="en">
+      <body className="antialiased">
         {children}
         {process.env.NODE_ENV === 'production' && <Analytics />}
       </body>
