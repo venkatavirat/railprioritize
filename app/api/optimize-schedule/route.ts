@@ -6,10 +6,19 @@ import {
 } from '@/lib/supabase/server'
 import { isDevAuthBypassEnabled } from '@/lib/auth-flags'
 import { loadUnifiedDataset, type SourceReport } from '@/lib/data-sources'
-import type {
-  CorridorWindow,
-  MaintenanceDefect,
-  OptimizationResult,
+import { computeDowntimeMetrics } from '@/lib/downtime-metrics'
+import {
+  analyseSpatialSafety,
+  SAFETY_BUFFER_METRES,
+  type SafeGroup,
+  type SpatialAnalysis,
+} from '@/lib/spatial-logic'
+import {
+  DELAY_ASSUMPTIONS,
+  type CorridorWindow,
+  type DowntimeMetrics,
+  type MaintenanceDefect,
+  type OptimizationResult,
 } from '@/lib/types'
 
 // Talks to Gemini and Supabase on every call — never prerender or cache.
@@ -34,7 +43,19 @@ OBJECTIVES:
 
 RULES:
 - Only combine tasks that share the same section_code.
+- A spatial safety pre-pass has already grouped the backlog into co-use groups
+  that satisfy the 500 m longitudinal buffer. NEVER merge tasks from two
+  different safety groups into one block, and never move a task between
+  groups: those separations are a physical safety constraint, not a
+  preference. You may split a group into more blocks if traffic demands it.
+- Where a group is marked requires_speed_restriction, say so in traffic_impact.
 - A block must fit inside one supplied corridor window; never invent a window.
+- FEASIBILITY: a block must also be LONG ENOUGH to do its work. Tasks from
+  different departments run in parallel, so the block's wall-clock duration
+  must be at least the longest single task duration_required_hrs it contains.
+  If no corridor window on a section is long enough for a task, leave that
+  task out of the plan rather than scheduling it into a window it cannot
+  finish in — an unexecutable block is worse than an unscheduled one.
 - Prefer windows with Low passenger traffic density and a low freight impact score.
 - downtime_saved_hours for a block = (sum of the individual task durations) - (the block's actual wall-clock duration). It is 0 when a block holds only one task.
 - Timestamps must be ISO-8601 UTC strings ending in Z.
@@ -182,13 +203,27 @@ export async function POST(request: NextRequest) {
     const horizonDays = horizon === 'monthly' ? 30 : 7
     const horizonEnd = Date.now() + horizonDays * 24 * 60 * 60 * 1000
 
-    defects = dataset.defects.slice(0, MAX_DEFECTS)
     windows = dataset.windows
       .filter((w) => {
         const start = Date.parse(w.window_start)
         return Number.isFinite(start) && start <= horizonEnd
       })
       .slice(0, MAX_WINDOWS)
+
+    // Only a fraction of the backlog fits in one request, and picking purely
+    // by risk can return 120 defects on sections that have no corridor window
+    // at all -- leaving the model nothing it can legally schedule. Prefer
+    // defects on sections that actually have availability, then fill the rest
+    // by risk so the backlog view still reflects the worst assets.
+    const sectionsWithWindows = new Set(windows.map((w) => w.section_code))
+    const schedulable = dataset.defects.filter((d) =>
+      sectionsWithWindows.has(d.section_code)
+    )
+    const rest = dataset.defects.filter(
+      (d) => !sectionsWithWindows.has(d.section_code)
+    )
+
+    defects = [...schedulable, ...rest].slice(0, MAX_DEFECTS)
   } catch (error) {
     return NextResponse.json(
       {
@@ -215,6 +250,12 @@ export async function POST(request: NextRequest) {
   }
 
   // ----- 2. Ask Gemini to reconcile them ----------------------------------
+  // ----- 2. Spatial safety pre-pass ---------------------------------------
+  // Runs before the model sees anything, so it is only ever offered groupings
+  // that already satisfy the longitudinal buffer.
+  const spatial: SpatialAnalysis = analyseSpatialSafety(defects)
+  const assetById = new Map(defects.map((d) => [d.id, d.asset_id]))
+
   const promptPayload = {
     planning_horizon:
       horizon === 'monthly'
@@ -231,6 +272,20 @@ export async function POST(request: NextRequest) {
       risk_score: d.risk_score,
       duration_required_hrs: d.duration_required_hrs,
       is_overdue: d.is_overdue,
+      chainage_km: d.chainage_km ?? null,
+    })),
+    // Pre-computed co-use groups. The model must respect these boundaries;
+    // see the RULES block in the system instruction.
+    safety_groups: spatial.groups.map((group) => ({
+      section_code: group.sectionCode,
+      group_id: `${group.sectionCode}#${group.sequence}`,
+      assets: group.defectIds
+        .map((id) => assetById.get(id))
+        .filter((a): a is string => Boolean(a)),
+      departments: group.departments,
+      chainage_start_km: group.chainageStartKm,
+      chainage_end_km: group.chainageEndKm,
+      requires_speed_restriction: group.requiresSpeedRestriction,
     })),
     corridor_windows: windows.map((w) => ({
       section_code: w.section_code,
@@ -291,11 +346,30 @@ export async function POST(request: NextRequest) {
     result.optimized_blocks = []
   }
 
+  // Deterministic arithmetic over whatever the model produced.
+  result.downtime_metrics = computeDowntimeMetrics(
+    result.optimized_blocks,
+    defects,
+    windows
+  )
+
   // ----- 3. Persist recommendations (best effort) --------------------------
-  const persistence = await persistBlocks(result, defects)
+  const persistence = await persistBlocks(result, defects, spatial)
 
   return NextResponse.json({
     ...result,
+    spatial_safety: {
+      buffer_metres: SAFETY_BUFFER_METRES,
+      groups: spatial.groups.length,
+      conflicts: spatial.conflicts.map((c) => ({
+        section_code: c.sectionCode,
+        assets: [c.a.assetId, c.b.assetId],
+        separation_metres: Math.round(c.separationMetres),
+        disposition: c.disposition,
+        reason: c.reason,
+      })),
+      unlocated_defects: spatial.unlocatedDefectIds.length,
+    },
     persisted: persistence,
     sources,
     usedSynthetic,
@@ -311,11 +385,22 @@ export async function POST(request: NextRequest) {
  */
 async function persistBlocks(
   result: OptimizationResult,
-  defects: MaintenanceDefect[]
+  defects: MaintenanceDefect[],
+  spatial: SpatialAnalysis
 ): Promise<{ saved: number; error: string | null }> {
   if (result.optimized_blocks.length === 0) return { saved: 0, error: null }
 
   const idByAsset = new Map(defects.map((d) => [d.asset_id, d.id]))
+
+  // Index the safety groups by member asset so a persisted block can carry
+  // the chainage bounds and TSR flag the block order has to print.
+  const groupByAsset = new Map<string, SafeGroup>()
+  for (const group of spatial.groups) {
+    for (const defectId of group.defectIds) {
+      const asset = defects.find((d) => d.id === defectId)?.asset_id
+      if (asset) groupByAsset.set(asset, group)
+    }
+  }
 
   // Synthetic rows carry generated ids like "tms_defects-0", which the
   // UUID[] column would reject. Only real database ids are recorded.
@@ -332,14 +417,42 @@ async function persistBlocks(
       const end = Date.parse(block.block_window_end)
       if (Number.isNaN(start) || Number.isNaN(end)) return null
 
+      // Chainage bounds and the TSR flag come from the safety groups the
+      // block's own tasks belong to.
+      const memberGroups = (block.combined_tasks ?? [])
+        .map((task) => groupByAsset.get(task.asset))
+        .filter((g): g is SafeGroup => Boolean(g))
+
+      const starts = memberGroups
+        .map((g) => g.chainageStartKm)
+        .filter((v): v is number => v !== null)
+      const ends = memberGroups
+        .map((g) => g.chainageEndKm)
+        .filter((v): v is number => v !== null)
+
+      const requiresTsr = memberGroups.some((g) => g.requiresSpeedRestriction)
+
       return {
         section_code: block.section_code,
         block_start: new Date(start).toISOString(),
         block_end: new Date(end).toISOString(),
+        original_block_start: new Date(start).toISOString(),
+        original_block_end: new Date(end).toISOString(),
         combined_departments: block.combined_departments ?? [],
         assigned_defect_ids: defectIds,
         total_downtime_saved_hrs: Number(block.downtime_saved_hours) || 0,
-        status: 'Recommended',
+        status: 'PROPOSED',
+        chainage_start_km: starts.length > 0 ? Math.min(...starts) : null,
+        chainage_end_km: ends.length > 0 ? Math.max(...ends) : null,
+        safety_flags: {
+          requiresSpeedRestriction: requiresTsr,
+          notes: requiresTsr
+            ? [
+                `Concurrent work inside the ${SAFETY_BUFFER_METRES} m longitudinal buffer; a temporary speed restriction is required.`,
+              ]
+            : [],
+        },
+        coa_window_ref: block.traffic_impact ?? null,
       }
     })
     .filter((row): row is NonNullable<typeof row> => row !== null)
@@ -358,3 +471,4 @@ async function persistBlocks(
     }
   }
 }
+

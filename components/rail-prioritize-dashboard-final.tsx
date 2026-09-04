@@ -4,6 +4,8 @@ import { useEffect, useMemo, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/lib/auth-context'
 import DataControlCenter from './data-control-center'
+import BlockApprovals from './block-approvals'
+import DowntimeSavings from './downtime-savings'
 import ChatAssistant from './chat-assistant'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
@@ -155,6 +157,7 @@ const TABS = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'backlog', label: 'Defect Backlog', icon: ClipboardList },
   { id: 'optimization', label: 'Block Optimization', icon: Gauge },
+  { id: 'approvals', label: 'Block Approvals', icon: CheckCircle2 },
   { id: 'corridors', label: 'Corridor Windows', icon: CalendarDays },
   { id: 'analytics', label: 'Analytics', icon: BarChart3 },
   { id: 'data', label: 'Data Ingestion', icon: Database },
@@ -480,6 +483,10 @@ export default function RailPrioritizeDashboard() {
 
             {activeTab === 'analytics' && (
               <AnalyticsView defects={defects} isLoading={loadingData} />
+            )}
+
+            {activeTab === 'approvals' && (
+              <BlockApprovals defects={defects} onChanged={loadData} />
             )}
 
             {activeTab === 'data' && (
@@ -952,6 +959,11 @@ function OptimizationView({
           {result.executive_summary}
         </p>
       </motion.div>
+
+      {/* Before-vs-after downtime, computed in code rather than by the model. */}
+      {result.downtime_metrics && (
+        <DowntimeSavings metrics={result.downtime_metrics} />
+      )}
 
       {/* KPI cards */}
       <div className="metric-grid">

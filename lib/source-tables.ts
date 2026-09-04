@@ -275,6 +275,32 @@ const DEFECT_FIELDS: FieldSpec[] = [
     aliases: ['overdue', 'is_late'],
     fallback: false,
   },
+  {
+    // Kilometre post of the work site. The source workbooks publish a single
+    // point; lib/spatial-logic.ts treats that as a zero-length extent.
+    column: 'chainage_km',
+    kind: 'number',
+    aliases: ['chainage', 'km', 'location_km', 'chainage_from_km'],
+    fallback: null,
+    min: 0,
+    max: 9999,
+  },
+  {
+    column: 'chainage_start_km',
+    kind: 'number',
+    aliases: ['chainage_start', 'from_km', 'start_km'],
+    fallback: null,
+    min: 0,
+    max: 9999,
+  },
+  {
+    column: 'chainage_end_km',
+    kind: 'number',
+    aliases: ['chainage_end', 'to_km', 'end_km'],
+    fallback: null,
+    min: 0,
+    max: 9999,
+  },
 ]
 
 /**

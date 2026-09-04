@@ -140,6 +140,17 @@ function toDefect(
     duration_required_hrs: Number(row.duration_required_hrs ?? 2),
     is_overdue: Boolean(row.is_overdue),
     created_at: String(row.created_at ?? new Date().toISOString()),
+    chainage_km: row.chainage_km === null || row.chainage_km === undefined
+      ? null
+      : Number(row.chainage_km),
+    chainage_start_km:
+      row.chainage_start_km === null || row.chainage_start_km === undefined
+        ? null
+        : Number(row.chainage_start_km),
+    chainage_end_km:
+      row.chainage_end_km === null || row.chainage_end_km === undefined
+        ? null
+        : Number(row.chainage_end_km),
   }
 }
 

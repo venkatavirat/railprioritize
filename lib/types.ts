@@ -31,6 +31,10 @@ export type MaintenanceDefect = {
   duration_required_hrs: number
   is_overdue: boolean
   created_at: string
+  /** Kilometre post of the work site, when the source supplies one. */
+  chainage_km?: number | null
+  chainage_start_km?: number | null
+  chainage_end_km?: number | null
 }
 
 /** A row of `corridor_windows` (COA traffic availability). */
@@ -53,6 +57,21 @@ export type BlockSchedule = {
   assigned_defect_ids: string[]
   total_downtime_saved_hrs: number
   status: string
+  /** The window the AI originally proposed, preserved across edits. */
+  original_block_start?: string | null
+  original_block_end?: string | null
+  approved_by?: string | null
+  approval_timestamp?: string | null
+  rejection_reason?: string | null
+  permit_number?: string | null
+  chainage_start_km?: number | null
+  chainage_end_km?: number | null
+  safety_flags?: {
+    requiresSpeedRestriction?: boolean
+    notes?: string[]
+  } | null
+  coa_window_ref?: string | null
+  created_at?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +105,103 @@ export type OptimizationResult = {
   kpi_metrics: KpiMetrics
   optimized_blocks: OptimizedBlock[]
   executive_summary: string
+  /** Computed in code, not by the model — see DowntimeMetrics. */
+  downtime_metrics?: DowntimeMetrics
+}
+
+/**
+ * Before-vs-after downtime accounting.
+ *
+ * Derived arithmetically from the plan rather than asked of the model: these
+ * numbers are quoted to a Sr. DEN, and a language model is the wrong tool for
+ * summing hours.
+ */
+export type DowntimeMetrics = {
+  /** Track hours if every department took its own separate block. */
+  total_uncoordinated_hours: number
+  /** Wall-clock track hours once bundled into joint blocks. */
+  joint_block_hours: number
+  /** ((uncoordinated - joint) / uncoordinated) * 100. */
+  downtime_reduction_percent: number
+  /** Estimated passenger delay avoided; see DELAY_ASSUMPTIONS. */
+  passenger_delay_minutes_saved: number
+  /** Tasks folded into shared blocks. */
+  tasks_planned: number
+  /** Blocks in the plan. */
+  blocks_planned: number
+  /**
+   * Blocks whose window is shorter than their longest single task, so they
+   * cannot physically be executed as scheduled. Any value above zero makes
+   * `downtime_reduction_percent` unreliable — the "saving" is then partly an
+   * artefact of compressing work into time that does not exist.
+   */
+  blocks_not_executable: number
+}
+
+/**
+ * Planning coefficients behind `passenger_delay_minutes_saved`.
+ *
+ * These are stated assumptions, not measurements: the corridor feed carries a
+ * traffic *density band* rather than a train count, so the figure is an
+ * order-of-magnitude planning aid and is labelled as such in the UI.
+ */
+export const DELAY_ASSUMPTIONS = {
+  /** Trains per hour affected by a block, by traffic density band. */
+  trainsPerHour: { High: 12, Medium: 6, Low: 2 } as Record<string, number>,
+  /** Average minutes lost per affected train. */
+  minutesPerTrain: 8,
+} as const
+
+// ---------------------------------------------------------------------------
+// Block approval workflow
+// ---------------------------------------------------------------------------
+
+export const BLOCK_STATUSES = [
+  'PROPOSED',
+  'APPROVED',
+  'MODIFIED',
+  'REJECTED',
+] as const
+export type BlockStatus = (typeof BLOCK_STATUSES)[number]
+
+export function isBlockStatus(value: unknown): value is BlockStatus {
+  return (
+    typeof value === 'string' && (BLOCK_STATUSES as readonly string[]).includes(value)
+  )
+}
+
+export const BLOCK_STATUS_STYLES: Record<
+  BlockStatus,
+  { label: string; bg: string; border: string; text: string; dot: string }
+> = {
+  PROPOSED: {
+    label: 'Proposed',
+    bg: 'bg-slate-50',
+    border: 'border-slate-300',
+    text: 'text-slate-700',
+    dot: 'bg-slate-500',
+  },
+  APPROVED: {
+    label: 'Approved',
+    bg: 'bg-green-50',
+    border: 'border-green-300',
+    text: 'text-green-800',
+    dot: 'bg-green-600',
+  },
+  MODIFIED: {
+    label: 'Modified',
+    bg: 'bg-amber-50',
+    border: 'border-amber-300',
+    text: 'text-amber-800',
+    dot: 'bg-amber-600',
+  },
+  REJECTED: {
+    label: 'Rejected',
+    bg: 'bg-red-50',
+    border: 'border-red-300',
+    text: 'text-red-800',
+    dot: 'bg-red-600',
+  },
 }
 
 /** Per-department colour tokens used across the schedule grid and legends. */
