@@ -1,0 +1,12 @@
+department,system_source,asset_id,asset_criticality_score,section_code,defect_description,risk_score,duration_required_hrs,is_overdue
+Engineering,TMS,TRK-5501,9,SC-KZJ-DN,Deep screening required over 900 m of fouled ballast,87,3,true
+Engineering,TMS,TRK-5522,6,SC-KZJ-DN,Rail grinding due at 5 gauge corner locations,63,2,false
+S&T,SMMS,PT-711,8,SC-KZJ-DN,Point machine obstruction test failure at 21A,82,2.5,true
+S&T,SMMS,SIG-330,5,SC-KZJ-DN,Signal lamp proving relay intermittent,51,1,false
+Traction_TRD,TDMS,OHE-455,9,SC-KZJ-DN,Cantilever insulator tracking marks across 8 spans,86,2,true
+Engineering,TMS,BRG-204,10,BZA-GDV-UP,Bridge bearing inspection overdue on major bridge 204,95,4,true
+S&T,SMMS,AXC-090,7,BZA-GDV-UP,Axle counter evaluator repeated resets,73,2,false
+Traction_TRD,TDMS,TSS-09,10,BZA-GDV-UP,Traction substation circuit breaker overhaul overdue,93,4,true
+Engineering,TMS,TRK-6140,7,GTL-BAY-UP,Tamping and lifting required over 600 m,69,3,false
+S&T,SMMS,IPS-031,8,GTL-BAY-UP,IPS battery bank capacity below 55 percent,79,2,true
+Traction_TRD,TDMS,OHE-512,6,GTL-BAY-UP,Dropper renewal at 15 locations,57,1.5,false
