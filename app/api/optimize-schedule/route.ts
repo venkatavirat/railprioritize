@@ -1,6 +1,11 @@
 import { GoogleGenAI, Type } from '@google/genai'
 import { NextRequest, NextResponse } from 'next/server'
-import { createSupabaseServiceClient } from '@/lib/supabase/server'
+import {
+  createSupabaseServerClient,
+  createSupabaseServiceClient,
+} from '@/lib/supabase/server'
+import { isDevAuthBypassEnabled } from '@/lib/auth-flags'
+import { loadUnifiedDataset, type SourceReport } from '@/lib/data-sources'
 import type {
   CorridorWindow,
   MaintenanceDefect,
@@ -122,6 +127,25 @@ const EMPTY_RESULT: OptimizationResult = {
 }
 
 export async function POST(request: NextRequest) {
+  // ----- 0. Authorisation -------------------------------------------------
+  // Every call is a billed Gemini request and writes to block_schedules, so
+  // this must not be reachable anonymously.
+  if (!isDevAuthBypassEnabled()) {
+    try {
+      const supabase = await createSupabaseServerClient()
+      const {
+        data: { user },
+      } = await supabase.auth.getUser()
+
+      if (!user) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      }
+    } catch {
+      // Supabase unreachable or misconfigured — fail closed.
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+  }
+
   // Horizon is optional; the dashboard toggle sends it.
   let horizon: 'weekly' | 'monthly' = 'weekly'
   try {
@@ -143,39 +167,32 @@ export async function POST(request: NextRequest) {
   }
 
   // ----- 1. Retrieve the backlog and corridor availability -----------------
+  // Reads the five source-system tables, substituting synthetic rows for any
+  // that are still empty. See lib/data-sources.ts.
   let defects: MaintenanceDefect[] = []
   let windows: CorridorWindow[] = []
+  let sources: SourceReport[] = []
+  let usedSynthetic = false
 
   try {
-    const supabase = createSupabaseServiceClient()
+    const dataset = await loadUnifiedDataset()
+    sources = dataset.sources
+    usedSynthetic = dataset.usedSynthetic
+
     const horizonDays = horizon === 'monthly' ? 30 : 7
-    const horizonEnd = new Date(
-      Date.now() + horizonDays * 24 * 60 * 60 * 1000
-    ).toISOString()
+    const horizonEnd = Date.now() + horizonDays * 24 * 60 * 60 * 1000
 
-    const [defectResult, windowResult] = await Promise.all([
-      supabase
-        .from('maintenance_defects')
-        .select('*')
-        .order('risk_score', { ascending: false })
-        .limit(MAX_DEFECTS),
-      supabase
-        .from('corridor_windows')
-        .select('*')
-        .lte('window_start', horizonEnd)
-        .order('window_start', { ascending: true })
-        .limit(MAX_WINDOWS),
-    ])
-
-    if (defectResult.error) throw new Error(defectResult.error.message)
-    if (windowResult.error) throw new Error(windowResult.error.message)
-
-    defects = (defectResult.data ?? []) as MaintenanceDefect[]
-    windows = (windowResult.data ?? []) as CorridorWindow[]
+    defects = dataset.defects.slice(0, MAX_DEFECTS)
+    windows = dataset.windows
+      .filter((w) => {
+        const start = Date.parse(w.window_start)
+        return Number.isFinite(start) && start <= horizonEnd
+      })
+      .slice(0, MAX_WINDOWS)
   } catch (error) {
     return NextResponse.json(
       {
-        error: `Could not read maintenance data from Supabase: ${
+        error: `Could not assemble the maintenance dataset: ${
           error instanceof Error ? error.message : 'unknown error'
         }`,
       },
@@ -184,7 +201,17 @@ export async function POST(request: NextRequest) {
   }
 
   if (defects.length === 0) {
-    return NextResponse.json(EMPTY_RESULT)
+    return NextResponse.json({ ...EMPTY_RESULT, sources, usedSynthetic })
+  }
+
+  if (windows.length === 0) {
+    return NextResponse.json({
+      ...EMPTY_RESULT,
+      executive_summary:
+        'No optimisation performed — no corridor windows fall inside the selected horizon.',
+      sources,
+      usedSynthetic,
+    })
   }
 
   // ----- 2. Ask Gemini to reconcile them ----------------------------------
@@ -267,7 +294,12 @@ export async function POST(request: NextRequest) {
   // ----- 3. Persist recommendations (best effort) --------------------------
   const persistence = await persistBlocks(result, defects)
 
-  return NextResponse.json({ ...result, persisted: persistence })
+  return NextResponse.json({
+    ...result,
+    persisted: persistence,
+    sources,
+    usedSynthetic,
+  })
 }
 
 /**
@@ -285,11 +317,16 @@ async function persistBlocks(
 
   const idByAsset = new Map(defects.map((d) => [d.asset_id, d.id]))
 
+  // Synthetic rows carry generated ids like "tms_defects-0", which the
+  // UUID[] column would reject. Only real database ids are recorded.
+  const isUuid = (value: string) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+
   const rows = result.optimized_blocks
     .map((block) => {
       const defectIds = (block.combined_tasks ?? [])
         .map((task) => idByAsset.get(task.asset))
-        .filter((id): id is string => Boolean(id))
+        .filter((id): id is string => Boolean(id) && isUuid(id as string))
 
       const start = Date.parse(block.block_window_start)
       const end = Date.parse(block.block_window_end)

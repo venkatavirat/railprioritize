@@ -85,7 +85,26 @@ CREATE TRIGGER on_auth_user_created
   FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
 -- ---------------------------------------------------------------------------
--- 5. HARDENING (optional — recommended before any real deployment)
+-- 5. Backfill profiles for users who already exist
+--
+-- The trigger above only fires on NEW auth.users rows. Anyone who signed up
+-- before this migration ran (or before the profiles table was dropped) would
+-- otherwise be left with an account that has no profile, and the dashboard
+-- would hang on "Loading your profile…".
+-- ---------------------------------------------------------------------------
+INSERT INTO public.profiles (id, email, department, full_name, role)
+SELECT
+  u.id,
+  u.email,
+  COALESCE(u.raw_user_meta_data ->> 'department', 'Operations'),
+  COALESCE(u.raw_user_meta_data ->> 'full_name', split_part(u.email, '@', 1)),
+  COALESCE(u.raw_user_meta_data ->> 'role', 'USER')
+FROM auth.users u
+WHERE u.email IS NOT NULL
+ON CONFLICT (id) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- 6. HARDENING (optional — recommended before any real deployment)
 --
 -- Uncomment to replace the permissive insert policy with one that only lets a
 -- signed-in user create their OWN profile row. Safe to apply because the

@@ -3,9 +3,8 @@
 import { useEffect, useMemo, useState, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/lib/auth-context'
-import CsvUploader from './csv-uploader'
+import DataControlCenter from './data-control-center'
 import ChatAssistant from './chat-assistant'
-import { getSupabaseBrowserClient } from '@/lib/supabase/client'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   AlertTriangle,
@@ -176,6 +175,7 @@ export default function RailPrioritizeDashboard() {
   const [windows, setWindows] = useState<CorridorWindow[]>([])
   const [loadingData, setLoadingData] = useState(false)
   const [dataError, setDataError] = useState<string | null>(null)
+  const [usedSynthetic, setUsedSynthetic] = useState(false)
 
   const [activeTab, setActiveTab] = useState<TabId>('overview')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
@@ -193,31 +193,23 @@ export default function RailPrioritizeDashboard() {
     setLoadingData(true)
     setDataError(null)
     try {
-      const supabase = getSupabaseBrowserClient()
+      // Served by the same loader the optimiser uses, so the two always agree
+      // — including when a source table is empty and falls back to synthetic.
+      const response = await fetch('/api/dataset')
+      const payload = await response.json()
 
-      const [defectResult, windowResult] = await Promise.all([
-        supabase
-          .from('maintenance_defects')
-          .select('*')
-          .order('risk_score', { ascending: false }),
-        supabase
-          .from('corridor_windows')
-          .select('*')
-          .order('window_start', { ascending: true }),
-      ])
+      if (!response.ok) {
+        throw new Error(payload?.error ?? `Request failed (${response.status})`)
+      }
 
-      if (defectResult.error) throw new Error(defectResult.error.message)
-      if (windowResult.error) throw new Error(windowResult.error.message)
-
-      setDefects((defectResult.data ?? []) as MaintenanceDefect[])
-      setWindows((windowResult.data ?? []) as CorridorWindow[])
+      setDefects((payload.defects ?? []) as MaintenanceDefect[])
+      setWindows((payload.windows ?? []) as CorridorWindow[])
+      setUsedSynthetic(Boolean(payload.usedSynthetic))
     } catch (error) {
       setDefects([])
       setWindows([])
       setDataError(
-        error instanceof Error
-          ? error.message
-          : 'Could not reach Supabase. Check the keys in .env.local.'
+        error instanceof Error ? error.message : 'Could not load the dataset.'
       )
     } finally {
       setLoadingData(false)
@@ -420,6 +412,23 @@ export default function RailPrioritizeDashboard() {
             transition={{ duration: 0.2 }}
             className="page-body"
           >
+            {usedSynthetic && !dataError && (
+              <div className="reoptimize-alert amber mb-5 flex items-center gap-3 rounded border-l-4 border-amber-500 bg-amber-50 p-3 text-sm text-amber-900">
+                <AlertTriangle size={17} className="shrink-0" />
+                <span>
+                  Some source systems have no records yet, so part of this view
+                  is <strong>synthetic sample data</strong>. Upload real
+                  extracts from the Data Ingestion tab to replace it.
+                </span>
+                <button
+                  onClick={() => setActiveTab('data')}
+                  className="ml-auto shrink-0 font-semibold underline"
+                >
+                  Review sources
+                </button>
+              </div>
+            )}
+
             {dataError && (
               <div className="reoptimize-alert error">
                 <AlertTriangle size={17} />
@@ -474,10 +483,7 @@ export default function RailPrioritizeDashboard() {
             )}
 
             {activeTab === 'data' && (
-              <div className="space-y-5">
-                <CsvUploader onUploaded={loadData} />
-                <IngestionSummary defects={defects} windows={windows} />
-              </div>
+              <DataControlCenter onDataChanged={loadData} />
             )}
 
             {activeTab === 'settings' && <SettingsView />}
@@ -1271,50 +1277,6 @@ function AnalyticsView({
         </div>
       </section>
     </div>
-  )
-}
-
-// ============================================================================
-// DATA INGESTION SUMMARY
-// ============================================================================
-
-function IngestionSummary({
-  defects,
-  windows,
-}: {
-  defects: MaintenanceDefect[]
-  windows: CorridorWindow[]
-}) {
-  const bySource = defects.reduce<Record<string, number>>((acc, defect) => {
-    acc[defect.system_source] = (acc[defect.system_source] ?? 0) + 1
-    return acc
-  }, {})
-
-  return (
-    <section className="panel">
-      <div className="panel-heading">
-        <h3>Current Dataset</h3>
-      </div>
-      <div className="grid gap-4 p-5 sm:grid-cols-2 lg:grid-cols-4">
-        <div className="rounded border border-slate-200 bg-slate-50 p-3 text-center">
-          <div className="text-2xl font-bold text-slate-800">{defects.length}</div>
-          <div className="text-xs text-slate-500">Total defects</div>
-        </div>
-        {Object.entries(bySource).map(([source, count]) => (
-          <div
-            key={source}
-            className="rounded border border-slate-200 bg-slate-50 p-3 text-center"
-          >
-            <div className="text-2xl font-bold text-slate-800">{count}</div>
-            <div className="text-xs text-slate-500">from {source}</div>
-          </div>
-        ))}
-        <div className="rounded border border-slate-200 bg-slate-50 p-3 text-center">
-          <div className="text-2xl font-bold text-slate-800">{windows.length}</div>
-          <div className="text-xs text-slate-500">COA windows</div>
-        </div>
-      </div>
-    </section>
   )
 }
 
