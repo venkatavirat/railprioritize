@@ -1,19 +1,30 @@
 import { NextRequest, NextResponse } from 'next/server'
-import Papa from 'papaparse'
 import {
   createSupabaseServerClient,
   createSupabaseServiceClient,
 } from '@/lib/supabase/server'
 import { isDevAuthBypassEnabled } from '@/lib/auth-flags'
-import { TABLE_SPECS, isSourceTable, mapRow } from '@/lib/source-tables'
+import {
+  TABLE_SPECS,
+  isSourceTable,
+  mapRow,
+  dedupeRows,
+  knownHeaderNames,
+} from '@/lib/source-tables'
+import { parseUploadedFile } from '@/lib/spreadsheet'
 
 export const dynamic = 'force-dynamic'
 
-/** Rows per upsert request, to stay under payload limits. */
-const BATCH_SIZE = 200
+/**
+ * Rows per upsert request.
+ *
+ * Large extracts are chunked so a single payload never trips Supabase's
+ * request size limit or the gateway timeout.
+ */
+const BATCH_SIZE = 500
 
 /** Refuse absurd uploads before reading them into memory. */
-const MAX_BYTES = 8 * 1024 * 1024
+const MAX_BYTES = 16 * 1024 * 1024
 
 /** Cap on how many problem lines we echo back. */
 const MAX_REPORTED_PROBLEMS = 10
@@ -89,40 +100,76 @@ export async function POST(request: NextRequest) {
     )
   }
 
-  // ----- Parse ------------------------------------------------------------
-  const text = await file.text()
+  // ----- Parse (CSV or Excel) ---------------------------------------------
+  const spec = TABLE_SPECS[tableName]
 
-  const parsed = Papa.parse<Record<string, unknown>>(text, {
-    header: true,
-    skipEmptyLines: true,
-    transformHeader: (header) => header.trim(),
-  })
-
-  if (!parsed.meta.fields || parsed.meta.fields.length === 0) {
+  let parsed
+  try {
+    parsed = await parseUploadedFile(file, {
+      // Prefer a worksheet named after the target domain, so a workbook
+      // holding one tab per department still reads the right sheet.
+      preferredSheets: [tableName, spec.label],
+      // Lets the parser locate the header row under a title banner.
+      knownHeaders: knownHeaderNames(spec),
+    })
+  } catch (error) {
     return NextResponse.json(
-      { success: false, error: 'That file has no header row.' },
+      {
+        success: false,
+        error: `Could not read that file: ${
+          error instanceof Error ? error.message : 'unsupported or corrupt'
+        }`,
+      },
       { status: 400 }
     )
   }
 
-  const spec = TABLE_SPECS[tableName]
-  const rows: Record<string, unknown>[] = []
+  if (parsed.headers.length === 0) {
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          parsed.format === 'excel'
+            ? `No header row found in worksheet "${parsed.sheetName ?? '(none)'}".`
+            : 'That file has no header row.',
+        availableSheets: parsed.availableSheets,
+        // Diagnostics: which row was chosen, and what was literally in it.
+        scannedHeaderRowIndex: parsed.headerRowIndex,
+        actualHeadersFound: parsed.rawHeaders,
+        expectedColumns: spec.fields.map((f) => f.column),
+      },
+      { status: 400 }
+    )
+  }
+
+  const mappedRows: Record<string, unknown>[] = []
   const problems: string[] = []
 
-  parsed.data.forEach((record, index) => {
-    // +2: one for the header line, one for 1-based numbering.
-    const { row, problem } = mapRow(spec, record, index + 2)
+  parsed.rows.forEach((record, index) => {
+    // Report the line as it appears in the user's file: the header's own
+    // position, plus one for the header line and one for 1-based numbering.
+    const lineNumber = index + parsed.headerRowIndex + 2
+    const { row, problem, warnings } = mapRow(spec, record, lineNumber)
     if (problem) problems.push(problem)
-    if (row) rows.push(row)
+    if (warnings) problems.push(...warnings)
+    if (row) mappedRows.push(row)
   })
 
-  if (rows.length === 0) {
+  if (mappedRows.length === 0) {
     return NextResponse.json(
       {
         success: false,
         error: 'No valid rows found.',
         table: tableName,
         rowsInserted: 0,
+        format: parsed.format,
+        sheetName: parsed.sheetName,
+        detectedColumns: parsed.headers,
+        headerRow: parsed.headerRowIndex + 1,
+        // Diagnostics: the row index actually scanned to, and the raw strings
+        // found there — enough to tell a banner from a real header.
+        scannedHeaderRowIndex: parsed.headerRowIndex,
+        actualHeadersFound: parsed.rawHeaders,
         expectedColumns: spec.fields.map((f) => f.column),
         problems: problems.slice(0, MAX_REPORTED_PROBLEMS),
       },
@@ -130,8 +177,17 @@ export async function POST(request: NextRequest) {
     )
   }
 
-  // ----- Upsert -----------------------------------------------------------
+  // Supabase's upsert rejects a batch outright if the same conflict key
+  // appears twice in it ("ON CONFLICT DO UPDATE command cannot affect row a
+  // second time"), which a real export can easily trigger — the same asset
+  // inspected twice in one day, say. Collapse those before batching; the
+  // later row in the file wins.
+  const { rows, duplicatesRemoved } = dedupeRows(spec, mappedRows)
+
+  // ----- Upsert in batches ------------------------------------------------
   let rowsInserted = 0
+  let batchesWritten = 0
+
   try {
     const supabase = createSupabaseServiceClient()
 
@@ -145,15 +201,20 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(
           {
             success: false,
-            error: `${error.message} (writing to ${tableName})`,
+            // Partial writes are possible: earlier batches already committed.
+            error: `${error.message} (writing to ${tableName}, batch ${batchesWritten + 1})`,
             table: tableName,
             rowsInserted,
+            partial: rowsInserted > 0,
+            scannedHeaderRowIndex: parsed.headerRowIndex,
+            actualHeadersFound: parsed.rawHeaders,
           },
           { status: 502 }
         )
       }
 
       rowsInserted += batch.length
+      batchesWritten += 1
     }
   } catch (error) {
     return NextResponse.json(
@@ -171,7 +232,16 @@ export async function POST(request: NextRequest) {
     success: true,
     rowsInserted,
     table: tableName,
-    rowsSkipped: parsed.data.length - rows.length,
+    // Rejected by validation, plus blank/comment lines dropped while parsing.
+    // Duplicates are reported separately since they were valid rows, just
+    // superseded by a later one sharing the same key.
+    rowsSkipped: parsed.rows.length - mappedRows.length + parsed.skipped,
+    duplicatesRemoved,
+    batches: batchesWritten,
+    format: parsed.format,
+    sheetName: parsed.sheetName,
+    // 1-based, so it lines up with what the user sees in Excel.
+    headerRow: parsed.headerRowIndex + 1,
     problems: problems.slice(0, MAX_REPORTED_PROBLEMS),
   })
 }

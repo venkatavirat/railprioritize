@@ -201,11 +201,27 @@ export async function loadUnifiedDataset(options?: {
     }
   }
 
+  // Fetch every table in one parallel batch. Awaiting them in sequence cost
+  // five serial round trips to Supabase, which dominated the response time.
+  const [tmsRows, smmsRows, tdmsRows, slotRows, demandRows] = await Promise.all([
+    fetchTable('tms_defects'),
+    fetchTable('smms_defects'),
+    fetchTable('tdms_defects'),
+    fetchTable('coa_slots'),
+    fetchTable('bdms_demands'),
+  ])
+
+  const defectRowsByTable: Record<DefectTable, RawRow[] | null> = {
+    tms_defects: tmsRows,
+    smms_defects: smmsRows,
+    tdms_defects: tdmsRows,
+  }
+
   // ----- Defect tables ----------------------------------------------------
   const defects: MaintenanceDefect[] = []
 
   for (const table of DEFECT_TABLES) {
-    const rows = await fetchTable(table)
+    const rows = defectRowsByTable[table]
 
     if (rows && rows.length > 0) {
       sources.push({ table, origin: 'database', rows: rows.length })
@@ -234,7 +250,6 @@ export async function loadUnifiedDataset(options?: {
 
   // ----- Corridor slots ---------------------------------------------------
   let windows: CorridorWindow[] = []
-  const slotRows = await fetchTable('coa_slots')
 
   if (slotRows && slotRows.length > 0) {
     sources.push({ table: 'coa_slots', origin: 'database', rows: slotRows.length })
@@ -257,7 +272,6 @@ export async function loadUnifiedDataset(options?: {
   // ----- BDMS demands -----------------------------------------------------
   // Reported for visibility. The optimiser derives its work from defects; the
   // demands table records what departments asked for under the old process.
-  const demandRows = await fetchTable('bdms_demands')
   if (demandRows) {
     if (demandRows.length > 0) {
       sources.push({

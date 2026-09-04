@@ -23,10 +23,36 @@ type UploadResponse = {
   success?: boolean
   rowsInserted?: number
   rowsSkipped?: number
+  /** Rows collapsed because they shared the same key elsewhere in the file. */
+  duplicatesRemoved?: number
+  batches?: number
+  format?: 'csv' | 'excel'
+  sheetName?: string
   table?: string
   error?: string
   problems?: string[]
   expectedColumns?: string[]
+  detectedColumns?: string[]
+  availableSheets?: string[]
+  partial?: boolean
+}
+
+/** Accepted by the file picker and validated again on drop. */
+const ACCEPTED_EXTENSIONS = ['.csv', '.xlsx', '.xls', '.xlsm']
+
+const ACCEPT_ATTRIBUTE = [
+  '.csv',
+  '.xlsx',
+  '.xls',
+  '.xlsm',
+  'text/csv',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+].join(',')
+
+function hasAcceptedExtension(fileName: string) {
+  const lowered = fileName.toLowerCase()
+  return ACCEPTED_EXTENSIONS.some((ext) => lowered.endsWith(ext))
 }
 
 export default function CsvUploader({
@@ -51,6 +77,7 @@ export default function CsvUploader({
   const [fileName, setFileName] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
   const [busy, setBusy] = useState(false)
+  const [dragging, setDragging] = useState(false)
   const [toast, setToast] = useState<Toast | null>(null)
 
   function reset() {
@@ -92,22 +119,53 @@ export default function CsvUploader({
 
       if (xhr.status >= 200 && xhr.status < 300 && payload.success) {
         const inserted = payload.rowsInserted ?? 0
+        const duplicates = payload.duplicatesRemoved ?? 0
+
+        const details = [`into ${TABLE_SPECS[table].label}`]
+        if (payload.format === 'excel' && payload.sheetName) {
+          details.push(`sheet "${payload.sheetName}"`)
+        }
+        if (payload.batches && payload.batches > 1) {
+          details.push(`${payload.batches} batches`)
+        }
+        if (payload.rowsSkipped) details.push(`${payload.rowsSkipped} skipped`)
+
+        // Called out as its own leading sentence — silently dropping rows the
+        // user's file actually contained is exactly the kind of thing a toast
+        // should surface, not bury alongside routine skip counts.
+        const detail =
+          duplicates > 0
+            ? `${duplicates} duplicate row${duplicates === 1 ? '' : 's'} merged (most recent kept) · ${details.join(' · ')}`
+            : details.join(' · ')
+
         setToast({
           kind: 'success',
-          title: `Imported ${inserted} row${inserted === 1 ? '' : 's'}`,
-          detail: `into ${TABLE_SPECS[table].label}${
-            payload.rowsSkipped ? ` · ${payload.rowsSkipped} skipped` : ''
-          }`,
+          title: `Imported ${inserted.toLocaleString()} row${inserted === 1 ? '' : 's'}`,
+          detail,
           problems: payload.problems,
         })
         await onUploaded?.(table)
       } else {
+        const hints: string[] = []
+        if (payload.availableSheets?.length) {
+          hints.push(`Worksheets found: ${payload.availableSheets.join(', ')}`)
+        }
+        if (payload.detectedColumns?.length) {
+          hints.push(`Detected columns: ${payload.detectedColumns.join(', ')}`)
+        }
+        if (payload.expectedColumns?.length) {
+          hints.push(`Expected: ${payload.expectedColumns.join(', ')}`)
+        }
+        if (payload.partial) {
+          hints.push(
+            `${payload.rowsInserted ?? 0} rows were already written before the failure.`
+          )
+        }
+
         setToast({
           kind: 'error',
           title: payload.error ?? `Upload failed (${xhr.status})`,
-          detail: payload.expectedColumns
-            ? `Expected columns: ${payload.expectedColumns.join(', ')}`
-            : undefined,
+          detail: hints.length > 0 ? hints.join(' — ') : undefined,
           problems: payload.problems,
         })
       }
@@ -127,9 +185,43 @@ export default function CsvUploader({
     xhr.send(body)
   }
 
+  /** Shared entry point for both the picker and a drop. */
+  function accept(file: File | undefined | null) {
+    if (!file) return
+
+    if (!hasAcceptedExtension(file.name)) {
+      setToast({
+        kind: 'error',
+        title: 'Unsupported file type',
+        detail: `${file.name} — accepted formats are ${ACCEPTED_EXTENSIONS.join(', ')}.`,
+      })
+      return
+    }
+
+    upload(file)
+  }
+
   function handleFile(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
-    if (file) upload(file)
+    accept(event.target.files?.[0])
+  }
+
+  function handleDrop(event: React.DragEvent<HTMLLabelElement>) {
+    event.preventDefault()
+    setDragging(false)
+    if (busy) return
+    accept(event.dataTransfer.files?.[0])
+  }
+
+  function handleDragOver(event: React.DragEvent<HTMLLabelElement>) {
+    // Required, otherwise the browser opens the file instead of dropping it.
+    event.preventDefault()
+    if (!busy) setDragging(true)
+  }
+
+  function handleDragLeave(event: React.DragEvent<HTMLLabelElement>) {
+    // Ignore bubbling from children, which would flicker the highlight.
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return
+    setDragging(false)
   }
 
   const spec = TABLE_SPECS[table]
@@ -163,21 +255,37 @@ export default function CsvUploader({
         )}
 
         <label
+          onDrop={handleDrop}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
           className={`flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed p-6 transition ${
             busy
               ? 'cursor-wait border-slate-200 bg-slate-50'
-              : 'cursor-pointer border-slate-300 hover:border-[#e27625] hover:bg-orange-50/40'
+              : dragging
+                ? 'cursor-copy border-[#e27625] bg-orange-50 ring-2 ring-[#e27625]/20'
+                : 'cursor-pointer border-slate-300 hover:border-[#e27625] hover:bg-orange-50/40'
           }`}
         >
           {busy ? (
             <Loader2 className="animate-spin text-[#e27625]" size={26} />
           ) : (
-            <UploadCloud className="text-slate-400" size={26} />
+            <UploadCloud
+              className={dragging ? 'text-[#e27625]' : 'text-slate-400'}
+              size={26}
+            />
           )}
 
           <span className="text-sm font-medium text-slate-700">
-            {busy ? `Uploading ${fileName}…` : 'Choose a CSV file'}
+            {busy
+              ? `Uploading ${fileName}…`
+              : dragging
+                ? 'Release to upload'
+                : 'Drag & drop CSV or Excel (.xlsx, .xls) file here'}
           </span>
+
+          {!busy && !dragging && (
+            <span className="text-xs text-slate-400">or click to browse</span>
+          )}
 
           <span className="text-center text-xs text-slate-500">
             Columns are matched by name — {spec.fields.map((f) => f.column).join(', ')}
@@ -186,7 +294,7 @@ export default function CsvUploader({
           <input
             ref={inputRef}
             type="file"
-            accept=".csv,text/csv"
+            accept={ACCEPT_ATTRIBUTE}
             onChange={handleFile}
             disabled={busy}
             className="hidden"
