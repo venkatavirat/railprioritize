@@ -6,6 +6,7 @@ import {
   PREVIEW_LIMIT,
 } from '@/lib/data-sources'
 import { isSourceTable } from '@/lib/source-tables'
+import { getCurrentUserId } from '@/lib/current-user'
 
 export const dynamic = 'force-dynamic'
 
@@ -21,6 +22,8 @@ export const dynamic = 'force-dynamic'
  * can never disagree about what the backlog is.
  */
 export async function GET(request: NextRequest) {
+  // Every read is scoped to the caller's own uploads.
+  const ownerId = await getCurrentUserId()
   const requestedTable = request.nextUrl.searchParams.get('table')
 
   const limitParam = Number(request.nextUrl.searchParams.get('limit'))
@@ -39,7 +42,7 @@ export async function GET(request: NextRequest) {
     }
 
     try {
-      const snapshot = await loadTableSnapshot(requestedTable, limit)
+      const snapshot = await loadTableSnapshot(requestedTable, limit, ownerId)
       return NextResponse.json({ snapshot })
     } catch (error) {
       return NextResponse.json(
@@ -55,8 +58,8 @@ export async function GET(request: NextRequest) {
   // ----- Full load --------------------------------------------------------
   try {
     const [dataset, snapshots] = await Promise.all([
-      loadUnifiedDataset(),
-      loadAllSnapshots(limit),
+      loadUnifiedDataset({ ownerId }),
+      loadAllSnapshots(limit, ownerId),
     ])
 
     return NextResponse.json({
@@ -64,6 +67,7 @@ export async function GET(request: NextRequest) {
       windows: dataset.windows,
       sources: dataset.sources,
       usedSynthetic: dataset.usedSynthetic,
+      isolationActive: dataset.isolationActive,
       snapshots,
     })
   } catch (error) {

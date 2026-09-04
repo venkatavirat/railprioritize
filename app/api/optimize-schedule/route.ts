@@ -7,6 +7,7 @@ import {
 import { isDevAuthBypassEnabled } from '@/lib/auth-flags'
 import { loadUnifiedDataset, type SourceReport } from '@/lib/data-sources'
 import { computeDowntimeMetrics } from '@/lib/downtime-metrics'
+import { getCurrentUserId } from '@/lib/current-user'
 import {
   analyseSpatialSafety,
   SAFETY_BUFFER_METRES,
@@ -196,7 +197,7 @@ export async function POST(request: NextRequest) {
   let usedSynthetic = false
 
   try {
-    const dataset = await loadUnifiedDataset()
+    const dataset = await loadUnifiedDataset({ ownerId: await getCurrentUserId() })
     sources = dataset.sources
     usedSynthetic = dataset.usedSynthetic
 

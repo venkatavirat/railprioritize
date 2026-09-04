@@ -179,6 +179,7 @@ export default function RailPrioritizeDashboard() {
   const [loadingData, setLoadingData] = useState(false)
   const [dataError, setDataError] = useState<string | null>(null)
   const [usedSynthetic, setUsedSynthetic] = useState(false)
+  const [isolationActive, setIsolationActive] = useState(true)
 
   const [activeTab, setActiveTab] = useState<TabId>('overview')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
@@ -208,6 +209,7 @@ export default function RailPrioritizeDashboard() {
       setDefects((payload.defects ?? []) as MaintenanceDefect[])
       setWindows((payload.windows ?? []) as CorridorWindow[])
       setUsedSynthetic(Boolean(payload.usedSynthetic))
+      setIsolationActive(payload.isolationActive !== false)
     } catch (error) {
       setDefects([])
       setWindows([])
@@ -415,6 +417,22 @@ export default function RailPrioritizeDashboard() {
             transition={{ duration: 0.2 }}
             className="page-body"
           >
+            {!isolationActive && !dataError && (
+              <div className="reoptimize-alert amber mb-5 flex items-center gap-3 rounded border-l-4 border-red-500 bg-red-50 p-3 text-sm text-red-900">
+                <AlertTriangle size={17} className="shrink-0" />
+                <span>
+                  <strong>Data is shared across all accounts.</strong> Per-user
+                  isolation is not active because the{' '}
+                  <code className="font-mono text-xs">uploaded_by</code> column
+                  does not exist yet. Run{' '}
+                  <code className="font-mono text-xs">
+                    database/2026-09-per-user-data-isolation.sql
+                  </code>{' '}
+                  to scope uploads to the account that made them.
+                </span>
+              </div>
+            )}
+
             {usedSynthetic && !dataError && (
               <div className="reoptimize-alert amber mb-5 flex items-center gap-3 rounded border-l-4 border-amber-500 bg-amber-50 p-3 text-sm text-amber-900">
                 <AlertTriangle size={17} className="shrink-0" />

@@ -68,6 +68,7 @@ export type AgentRunResult = {
 /** Mutable state shared across tool calls within one run. */
 type RunContext = {
   sectionCode: string
+  ownerId: string | null
   defects: MaintenanceDefect[]
   windows: CorridorWindow[]
   spatial: SpatialAnalysis | null
@@ -110,7 +111,7 @@ function buildTools(ctx: RunContext) {
         const section = section_code?.trim() || ctx.sectionCode
         ctx.sectionCode = section
 
-        const dataset = await loadUnifiedDataset()
+        const dataset = await loadUnifiedDataset({ ownerId: ctx.ownerId })
 
         ctx.defects = dataset.defects.filter((d) => d.section_code === section)
         ctx.windows = dataset.windows.filter((w) => w.section_code === section)
@@ -372,6 +373,7 @@ async function persistProposals(
         .filter((id): id is string => Boolean(id) && isUuid(id as string)),
       total_downtime_saved_hrs: Number(block.downtime_saved_hours) || 0,
       status: 'PROPOSED',
+      uploaded_by: ctx.ownerId,
       chainage_start_km: starts.length > 0 ? Math.min(...starts) : null,
       chainage_end_km: ends.length > 0 ? Math.max(...ends) : null,
       safety_flags: {
@@ -427,6 +429,8 @@ Finish with a short plain-language summary of what you scheduled and what you de
 export async function runPlanningAgent(options?: {
   sectionCode?: string
   apiKey?: string
+  /** Account the run belongs to; scopes both the data read and rows written. */
+  ownerId?: string | null
 }): Promise<AgentRunResult> {
   const apiKey = options?.apiKey ?? process.env.GEMINI_API_KEY
   if (!apiKey) {
@@ -435,6 +439,7 @@ export async function runPlanningAgent(options?: {
 
   const ctx: RunContext = {
     sectionCode: options?.sectionCode?.trim() || DEFAULT_SECTION_CODE,
+    ownerId: options?.ownerId ?? null,
     defects: [],
     windows: [],
     spatial: null,

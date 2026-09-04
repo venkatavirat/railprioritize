@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
 import { isDevAuthBypassEnabled } from '@/lib/auth-flags'
 import { runPlanningAgent, DEFAULT_SECTION_CODE } from '@/lib/agent'
+import { getCurrentUserId } from '@/lib/current-user'
 
 export const dynamic = 'force-dynamic'
 
@@ -68,7 +69,10 @@ export async function POST(request: NextRequest) {
   const startedAt = Date.now()
 
   try {
-    const result = await runPlanningAgent({ sectionCode })
+    const result = await runPlanningAgent({
+      sectionCode,
+      ownerId: await getCurrentUserId(),
+    })
 
     return NextResponse.json({
       success: true,

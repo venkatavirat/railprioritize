@@ -36,6 +36,21 @@ export type UnifiedDataset = {
   sources: SourceReport[]
   /** True when any part of the dataset came from the synthetic engine. */
   usedSynthetic: boolean
+  /**
+   * False when per-user isolation could not be applied because the
+   * `uploaded_by` column does not exist yet — the data shown is shared across
+   * all accounts until database/2026-09-per-user-data-isolation.sql is run.
+   */
+  isolationActive: boolean
+}
+
+/** True when a Postgres error is "that column doesn't exist". */
+function isMissingColumn(message: string, column: string): boolean {
+  return (
+    message.includes(`'${column}' column`) ||
+    message.includes(`column "${column}"`) ||
+    message.includes(`.${column} does not exist`)
+  )
 }
 
 const DEFECT_TABLES = ['tms_defects', 'smms_defects', 'tdms_defects'] as const
@@ -60,6 +75,14 @@ export type TableSnapshot = {
 export const PREVIEW_LIMIT = 10
 
 /**
+ * Ceiling on rows pulled per table for the unified view.
+ *
+ * Without it the dashboard fetched every row on every load -- with ~18,000
+ * rows across the source tables that dominated page load time.
+ */
+const MAX_ROWS_PER_TABLE = 2000
+
+/**
  * Loads one source table's status and a preview of its newest rows.
  *
  * Falls back to synthetic rows when the table is empty or unreachable, so the
@@ -68,7 +91,8 @@ export const PREVIEW_LIMIT = 10
  */
 export async function loadTableSnapshot(
   table: SourceTable,
-  limit: number = PREVIEW_LIMIT
+  limit: number = PREVIEW_LIMIT,
+  ownerId?: string | null
 ): Promise<TableSnapshot> {
   const synthesise = (error?: string): TableSnapshot => {
     const rows = generateSyntheticData(table) as unknown as RawRow[]
@@ -92,11 +116,23 @@ export async function loadTableSnapshot(
   }
 
   try {
-    const { data, error, count } = await client
-      .from(table)
-      .select('*', { count: 'exact' })
-      .order('created_at', { ascending: false })
-      .limit(limit)
+    const runSnapshot = (scoped: boolean) => {
+      let q = client
+        .from(table)
+        .select('*', { count: 'exact' })
+        .order('created_at', { ascending: false })
+        .limit(limit)
+      if (scoped && ownerId) q = q.eq('uploaded_by', ownerId)
+      return q
+    }
+
+    let { data, error, count } = await runSnapshot(Boolean(ownerId))
+
+    // Isolation migration not applied yet -- read unscoped rather than
+    // reporting the table as empty.
+    if (error && isMissingColumn(error.message, 'uploaded_by')) {
+      ;({ data, error, count } = await runSnapshot(false))
+    }
 
     if (error) return synthesise(error.message)
 
@@ -118,9 +154,12 @@ export async function loadTableSnapshot(
 
 /** Loads snapshots for every source table, in registry order. */
 export async function loadAllSnapshots(
-  limit: number = PREVIEW_LIMIT
+  limit: number = PREVIEW_LIMIT,
+  ownerId?: string | null
 ): Promise<TableSnapshot[]> {
-  return Promise.all(SOURCE_TABLES.map((table) => loadTableSnapshot(table, limit)))
+  return Promise.all(
+    SOURCE_TABLES.map((table) => loadTableSnapshot(table, limit, ownerId))
+  )
 }
 
 function toDefect(
@@ -173,8 +212,11 @@ function toWindow(row: RawRow, index: number): CorridorWindow {
  */
 export async function loadUnifiedDataset(options?: {
   seed?: number
+  /** Restricts the dataset to one account's uploads. */
+  ownerId?: string | null
 }): Promise<UnifiedDataset> {
   const sources: SourceReport[] = []
+  let isolationActive = Boolean(options?.ownerId)
   let client: ReturnType<typeof createSupabaseServiceClient> | null = null
 
   try {
@@ -195,7 +237,24 @@ export async function loadUnifiedDataset(options?: {
   async function fetchTable(table: SourceTable): Promise<RawRow[] | null> {
     if (!client) return null
     try {
-      const { data, error } = await client.from(table).select('*')
+      const run = async (scoped: boolean) => {
+        let query = client!.from(table).select('*').limit(MAX_ROWS_PER_TABLE)
+        if (scoped && options?.ownerId) {
+          query = query.eq('uploaded_by', options.ownerId)
+        }
+        return query
+      }
+
+      let { data, error } = await run(Boolean(options?.ownerId))
+
+      // The isolation migration may not have been applied yet. Fall back to an
+      // unscoped read rather than showing the user nothing, and record that
+      // isolation is inactive so the UI can say so plainly.
+      if (error && isMissingColumn(error.message, 'uploaded_by')) {
+        isolationActive = false
+        ;({ data, error } = await run(false))
+      }
+
       if (error) {
         sources.push({ table, origin: 'unavailable', rows: 0, error: error.message })
         return null
@@ -311,5 +370,6 @@ export async function loadUnifiedDataset(options?: {
     windows,
     sources,
     usedSynthetic: sources.some((s) => s.origin !== 'database'),
+    isolationActive,
   }
 }

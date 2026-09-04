@@ -12,6 +12,7 @@ import {
   knownHeaderNames,
 } from '@/lib/source-tables'
 import { parseUploadedFile } from '@/lib/spreadsheet'
+import { getCurrentUserId } from '@/lib/current-user'
 
 export const dynamic = 'force-dynamic'
 
@@ -30,6 +31,10 @@ const MAX_BYTES = 16 * 1024 * 1024
 const MAX_REPORTED_PROBLEMS = 10
 
 export async function POST(request: NextRequest) {
+  // Owner of everything this request writes. Resolved before any work so an
+  // unidentifiable caller cannot reach the database at all.
+  const ownerId = await getCurrentUserId()
+
   // ----- Authorisation ----------------------------------------------------
   // This endpoint bulk-writes to the database, so it must not be open.
   if (!isDevAuthBypassEnabled()) {
@@ -182,20 +187,60 @@ export async function POST(request: NextRequest) {
   // second time"), which a real export can easily trigger — the same asset
   // inspected twice in one day, say. Collapse those before batching; the
   // later row in the file wins.
-  const { rows, duplicatesRemoved } = dedupeRows(spec, mappedRows)
+  const { rows: dedupedRows, duplicatesRemoved } = dedupeRows(spec, mappedRows)
+
+  // Stamp ownership so this upload is visible only to the account that made
+  // it. Dropped harmlessly by the retry below if the isolation migration has
+  // not been run yet.
+  const rows: Record<string, unknown>[] = ownerId
+    ? dedupedRows.map((row) => ({ ...row, uploaded_by: ownerId }))
+    : dedupedRows
 
   // ----- Upsert in batches ------------------------------------------------
   let rowsInserted = 0
   let batchesWritten = 0
+  const droppedColumns: string[] = []
 
   try {
     const supabase = createSupabaseServiceClient()
 
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-      const batch = rows.slice(i, i + BATCH_SIZE)
-      const { error } = await supabase
-        .from(tableName)
-        .upsert(batch, { onConflict: spec.conflictTarget })
+      let batch = rows.slice(i, i + BATCH_SIZE).map((row) => {
+        // Re-apply drops discovered on an earlier batch.
+        if (droppedColumns.length === 0) return row
+        const copy = { ...row }
+        for (const column of droppedColumns) delete copy[column]
+        return copy
+      })
+
+      let error = (
+        await supabase.from(tableName).upsert(batch, { onConflict: spec.conflictTarget })
+      ).error
+
+      // The ingest spec can legitimately know about a column the database has
+      // not gained yet (a pending migration). Rather than failing the whole
+      // upload, drop the unknown column and retry -- the rest of the row is
+      // still worth keeping. Each pass can only reveal one missing column, so
+      // loop until it writes or runs out of columns to shed.
+      let guard = 0
+      while (error && guard < 12) {
+        const missing = /Could not find the '([^']+)' column/.exec(error.message)?.[1]
+        if (!missing) break
+
+        droppedColumns.push(missing)
+        batch = batch.map((row) => {
+          const copy = { ...row }
+          delete copy[missing]
+          return copy
+        })
+
+        error = (
+          await supabase
+            .from(tableName)
+            .upsert(batch, { onConflict: spec.conflictTarget })
+        ).error
+        guard += 1
+      }
 
       if (error) {
         return NextResponse.json(
@@ -240,6 +285,8 @@ export async function POST(request: NextRequest) {
     batches: batchesWritten,
     format: parsed.format,
     sheetName: parsed.sheetName,
+    // Columns the file supplied that the database does not have yet.
+    droppedColumns: Array.from(new Set(droppedColumns)),
     // 1-based, so it lines up with what the user sees in Excel.
     headerRow: parsed.headerRowIndex + 1,
     problems: problems.slice(0, MAX_REPORTED_PROBLEMS),
